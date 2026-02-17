@@ -1,0 +1,11 @@
+# 파이썬 캐시 및 가상환경 무시
+__pycache__/
+*.py[cod]
+*.class
+venv/
+env/
+
+# ROS 2 빌드 찌꺼기 무시 (혹시 패키지 안에 잘못 생성된 경우 대비)
+build/
+install/
+log/
