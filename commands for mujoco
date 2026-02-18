@@ -1,2 +1,26 @@
+#tsid_controller.py
 ctrl + 우클릭: 목표의 pose 이동
 ctrl + 좌클릭: 목표 orientation이동
+
+#tsid_ros_node.py
+
+<terminal 1>
+venv키기
+cd ~/ros2_ws_py/src/franka_tsid_control/franka_tsid_control
+python3 tsid_ros_node.py
+
+<terminal 2>
+ros2 run robot_state_publisher robot_state_publisher --ros-args -p robot_description:="$(cat panda_fixed.urdf)"
+
+
+<terminal 3>
+
+# ros2 run tf2_ros static_transform_publisher "0" "0" "0" "0" "0" "0" "world" "panda_link0" &
+
+rviz2
+
+1. panda_link8이 아니라 panda_hand를 목표로 삼아야함
+2. 목표 방위도 z축 기준으로만 랜덤하게 회전 x 다른 가능한 방향으로도 설정
+3. marker의 화살표 조정 
+4. rviz2에 robotmodel이 안보임
+

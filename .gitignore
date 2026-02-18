@@ -9,3 +9,10 @@ env/
 build/
 install/
 log/
+__pycache__/
+*.pyc
+.vscode/
+venv/
+build/
+install/
+log/
