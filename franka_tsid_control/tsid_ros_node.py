@@ -59,8 +59,15 @@ class MinJerkTrajectory:
         current_log = self.log_diff * s
         q_relative = pin.Quaternion(pin.exp3(current_log))
         q_ref = self.q0 * q_relative
-        w_ref = self.log_diff * s_dot
-        dw_ref = self.log_diff * s_ddot
+
+        #------local to world-----
+
+        w_local = self.log_diff * s_dot
+        dw_local = self.log_diff * s_ddot
+
+        R = q_ref.matrix()
+        w_ref = R @ w_local
+        dw_ref = R @ dw_local
         
         return p_ref, v_ref, a_ref, q_ref, w_ref, dw_ref
 
@@ -70,6 +77,9 @@ class TsidAllInOneNode(Node):
         super().__init__('tsid_controller_node')
         print("initiating robot model...")
 
+        self.publish_rate = 30.0 
+        self.last_pub_time = 0.0
+        
         # MuJoCo & Pinocchio setting
         xml_path = os.path.expanduser("~/ros2_ws_py/src/mujoco_menagerie/franka_emika_panda/scene.xml")
         self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
@@ -87,7 +97,7 @@ class TsidAllInOneNode(Node):
         self.Kp_pos, self.Kd_pos = 250.0, 2.0 * np.sqrt(250.0)
         self.Kp_rot, self.Kd_rot = 250.0, 2.0 * np.sqrt(250.0)
         self.Kp_post, self.Kd_post = 125.0, 2.0 * np.sqrt(125.0)
-        self.w_ee, self.w_post = 1.0, 0.009
+        self.w_ee, self.w_post = 1.0, 0.007
         self.q_nominal = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
         self.tau_max = np.array([87, 87, 87, 87, 12, 12, 12], dtype=float)
 
@@ -206,10 +216,10 @@ class TsidAllInOneNode(Node):
                     target_pos, target_quat = self.generate_random_target()
                     print(f"\n[New Target] Pos: {np.round(target_pos,2)}")
                     self.traj = MinJerkTrajectory(curr_pos, curr_quat, target_pos, target_quat, self.move_duration)
-                    self.start_time = time.time()
+                    self.start_time = self.mj_data.time
                     self.state = "MOVING"
 
-                elapsed = time.time() - self.start_time
+                elapsed = self.mj_data.time- self.start_time
                 p_ref, v_ref, a_ref, q_ref, w_ref, dw_ref = self.traj.get_state(elapsed)
 
                 # --- 오차 계산 및 검사 ---
@@ -232,7 +242,20 @@ class TsidAllInOneNode(Node):
                 pin.updateFramePlacements(self.pin_model, self.pin_data)
                 
                 J = pin.getFrameJacobian(self.pin_model, self.pin_data, self.pin_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)[:, :self.n_arm]
-                dJV = pin.getFrameAcceleration(self.pin_model, self.pin_data, self.pin_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).vector
+                
+                pin.computeJointJacobiansTimeVariation(self.pin_model, self.pin_data, q_pin, v_pin)
+                pin.updateFramePlacements(self.pin_model, self.pin_data)
+                Jdot_full = pin.getFrameJacobianTimeVariation(
+                    self.pin_model, 
+                    self.pin_data, 
+                    self.pin_ee_id, 
+                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+                )
+
+                # 3. 전체 행렬 중 로봇 팔의 자유도(n_arm)만큼 슬라이싱 후 현재 속도(v_arm)와 행렬 곱셈
+                Jdot = Jdot_full[:, :self.n_arm]
+
+                dJV = Jdot @ v_arm
                 curr_v_pin = pin.getFrameVelocity(self.pin_model, self.pin_data, self.pin_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).linear
                 curr_w_pin = pin.getFrameVelocity(self.pin_model, self.pin_data, self.pin_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).angular
 
@@ -249,7 +272,7 @@ class TsidAllInOneNode(Node):
                     integral_error_rot += e_rot_vec * dt
                     
                     # 적분값 제한 (폭주 방지, 최대 0.5 정도의 가속도 기여)
-                    limit = 0.7
+                    limit = 0.25
                     integral_error_pos = np.clip(integral_error_pos, -limit, limit)
                     integral_error_rot = np.clip(integral_error_rot, -limit, limit)
 
@@ -272,7 +295,11 @@ class TsidAllInOneNode(Node):
 
                 mujoco.mj_step(self.mj_model, self.mj_data)
                 viewer.sync()
-                self.publish_ros_msgs(q_arm)
+
+                current_sim_time = self.mj_data.time
+                if current_sim_time - self.last_pub_time >= (1.0 / self.publish_rate):
+                    self.publish_ros_msgs(q_arm)
+                    self.last_pub_time = current_sim_time
                 
                 dt_step = time.time() - step_start
                 if dt_step < self.mj_model.opt.timestep: time.sleep(self.mj_model.opt.timestep - dt_step)
