@@ -24,7 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'tsid_controller = franka_tsid_control.tsid_controller:main'
+            'tsid_controller = franka_tsid_control.tsid_controller:main',
+            'tsid_ros_node = franka_tsid_control.tsid_ros_node:main',
+            'tsid_ros_node2 = franka_tsid_control.tsid_ros_node_2:main'
         ],
     },
 )

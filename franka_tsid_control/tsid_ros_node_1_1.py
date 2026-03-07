@@ -94,9 +94,9 @@ class TsidAllInOneNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         # Control Gain
-        self.Kp_pos, self.Kd_pos = 260.0, 2.0 * np.sqrt(260.0)
-        self.Kp_rot, self.Kd_rot = 260.0, 2.0 * np.sqrt(260.0)
-        self.Kp_post, self.Kd_post = 130.0, 2.0 * np.sqrt(130.0)
+        self.Kp_pos, self.Kd_pos = 200.0, 2.0 * np.sqrt(200.0)
+        self.Kp_rot, self.Kd_rot = 200.0, 2.0 * np.sqrt(200.0)
+        self.Kp_post, self.Kd_post = 100.0, 2.0 * np.sqrt(100.0)
         self.w_ee, self.w_post = 1.0, 0.009
         self.q_nominal = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
         self.tau_max = np.array([87, 87, 87, 87, 12, 12, 12], dtype=float)
@@ -180,8 +180,8 @@ class TsidAllInOneNode(Node):
         print("🚀 시뮬레이션 시작! (Ki 제어 추가됨)")
         
         # 1. 게인 설정 (I 게인 추가!)
-        Ki_pos = 120.0   # 위치 오차를 잡는 적분 게인
-        Ki_rot = 60.0    # 자세 오차를 잡는 적분 게인
+        Ki_pos = 40.0   # 위치 오차를 잡는 적분 게인
+        Ki_rot = 20.0    # 자세 오차를 잡는 적분 게인
         dt = self.mj_model.opt.timestep # 시뮬레이션 타임스텝 (보통 0.002초)
 
         # 오차 적분값 저장 변수 (누적 에러)
@@ -294,18 +294,40 @@ class TsidAllInOneNode(Node):
                 e_post = self.q_nominal - q_arm
                 a_post = self.Kp_post * e_post - self.Kd_post * v_arm
                 
+                # --- 기존 QP 목적함수 및 토크 제약조건 계산 ---
                 P = (self.w_ee * J.T @ J) + (self.w_post * np.eye(self.n_arm)) + (1e-4 * np.eye(self.n_arm))
                 q_qp = -(self.w_ee * J.T @ b_acc) - (self.w_post * a_post)
                 M = self.pin_data.M[:self.n_arm, :self.n_arm]
                 h = self.pin_data.nle[:self.n_arm]
                 
-                ddq = solve_qp(P, q_qp, np.vstack([M, -M]), np.concatenate([self.tau_max - h, self.tau_max + h]), solver="osqp")
+                G_ineq = np.vstack([M, -M])
+                h_ineq = np.concatenate([self.tau_max - h, self.tau_max + h])
+
+                # ---------------------------------------------------------
+                # 🛡️ [NEW] 2번 방법: 가상 댐퍼 (Control Barrier Function) 기반 관절 한계
+                # 한계에 가까워지면 스프링-댐퍼처럼 부드럽게 가속도를 밀어냅니다.
+                # ---------------------------------------------------------
+                margin = 0.05  # 한계치 충돌 전 여유 공간 (약 2.8도)
+                K_lim = 50.0   # 밀어내는 가상의 스프링 강성 (클수록 튕겨내는 힘이 강함)
+                D_lim = 2.0 * np.sqrt(K_lim)  # 진동을 막는 댐퍼 (임계 제동)
+                
+                # 수식: ddq <= K_p * (q_limit - margin - q) - K_d * v
+                ddq_ub = K_lim * (q_upper - margin - q_arm) - D_lim * v_arm
+                ddq_lb = K_lim * (q_lower + margin - q_arm) - D_lim * v_arm
+                
+                # 현실적인 최대 가속도 제한 및 역전 현상 방지
+                ddq_ub = np.clip(ddq_ub, -50.0, 50.0)
+                ddq_lb = np.clip(ddq_lb, -50.0, 50.0)
+                ddq_lb = np.minimum(ddq_lb, ddq_ub - 0.1) # 하한이 상한보다 커지지 않도록 방어
+                # ---------------------------------------------------------
+                
+                # QP 솔버에 lb, ub 파라미터 적용
+                ddq = solve_qp(P, q_qp, G_ineq, h_ineq, lb=ddq_lb, ub=ddq_ub, solver="osqp")
                 
                 # QP 솔버 결과로 현재 토크(current_tau)를 계산하고 저장 및 적용
                 if ddq is not None: 
                     current_tau = M @ ddq + h
                     self.mj_data.ctrl[:self.n_arm] = current_tau
-
                 mujoco.mj_step(self.mj_model, self.mj_data)
                 viewer.sync()
 
