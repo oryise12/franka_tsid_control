@@ -1,4 +1,3 @@
-#-------- HQP-----------
 # -------import base package---------
 import os
 import time
@@ -23,6 +22,7 @@ from robot_descriptions.panda_description import URDF_PATH
 
 # ---------Generate Trajectory----------
 class MinJerkTrajectory:
+
     #---------Calculate Error between current and target---------
     def __init__(self, start_pos, start_quat, end_pos, end_quat, duration):
         self.p0 = np.array(start_pos)
@@ -40,6 +40,9 @@ class MinJerkTrajectory:
 
     # --------Calculate Trajectory that robot would follow ----------
     def get_state(self, t):
+
+        # publsih last target even though time is over
+        # anyway at t = T, value published is same that return value.
         if t >= self.T: 
             return (self.pf, np.zeros(3), np.zeros(3), self.qf, np.zeros(3), np.zeros(3))
             
@@ -58,6 +61,7 @@ class MinJerkTrajectory:
         q_ref = self.q0 * q_relative
 
         #------local to world-----
+
         w_local = self.log_diff * s_dot
         dw_local = self.log_diff * s_ddot
 
@@ -90,11 +94,10 @@ class TsidAllInOneNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         # Control Gain
-        self.Kp_pos, self.Kd_pos = 250.0, 2.0 * np.sqrt(250.0)
-        self.Kp_rot, self.Kd_rot = 250.0, 2.0 * np.sqrt(250.0)
-        self.Kp_post, self.Kd_post = 125.0, 2.0 * np.sqrt(125.0)
-        
-        # HQP에서는 w_ee, w_post 같은 가중치가 더 이상 필요하지 않아 제거했습니다.
+        self.Kp_pos, self.Kd_pos = 200.0, 2.0 * np.sqrt(200.0)
+        self.Kp_rot, self.Kd_rot = 200.0, 2.0 * np.sqrt(200.0)
+        self.Kp_post, self.Kd_post = 100.0, 2.0 * np.sqrt(100.0)
+        self.w_ee, self.w_post = 1.0, 0.009
         self.q_nominal = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
         self.tau_max = np.array([87, 87, 87, 87, 12, 12, 12], dtype=float)
 
@@ -109,18 +112,30 @@ class TsidAllInOneNode(Node):
         mujoco.mj_step(self.mj_model, self.mj_data)
 
     def generate_random_target(self):
+        # 1. 위치: 로봇 앞쪽 공간으로 제한 
+        # x: 앞쪽 0.3 ~ 0.6m, y: 좌우 -0.3 ~ 0.3m, z: 높이 0.2 ~ 0.5m
         pos = np.array([np.random.uniform(0.3, 0.6), 
                         np.random.uniform(-0.2, 0.2),
                         np.random.uniform(0.2, 0.5)])
 
+        # (1) 기본 자세: 바닥 보기 (w=0, x=1, y=0, z=0)
         q_home = pin.Quaternion(0, 1, 0, 0)
 
-        roll  = np.random.uniform(-0.39, 0.39) 
-        pitch = np.random.uniform(-0.39, 0.39)  
-        yaw   = np.random.uniform(0, 1.57)  
+        # (2) 랜덤 각도 생성 (Roll, Pitch, Yaw)
+        # - Roll (X축 회전): 좌우로 기울기 (+- 45도)
+        # - Pitch (Y축 회전): 앞뒤로 까닥거리기 (+- 45도)
+        # - Yaw (Z축 회전): 제자리 뱅글뱅글 (360도 자유)
+        roll  = np.random.uniform(-0.39, 0.39) # 약 +/- 22.5도
+        pitch = np.random.uniform(-0.39, 0.39)  # 약 +/- 22.6도
+        yaw   = np.random.uniform(0, 1.57)  # +/- 90도 (완전 자유)
 
+        # (3) RPY -> Rotation Matrix 변환 (Pinocchio 유틸리티 사용)
         rot_mat = pin.utils.rpyToMatrix(roll, pitch, yaw)
+        
+        # (4) 회전 행렬을 쿼터니언으로 변환
         q_rand = pin.Quaternion(rot_mat)
+        
+        # (5) 최종 자세 = (기본 자세) * (랜덤 회전)
         quat = q_home * q_rand
         
         return pos, quat
@@ -128,6 +143,7 @@ class TsidAllInOneNode(Node):
     def publish_ros_msgs(self, q_arm):
         now = self.get_clock().now().to_msg()
         
+        # 1. World 좌표계 방송
         t = TransformStamped()
         t.header.stamp = now
         t.header.frame_id = "world"
@@ -135,12 +151,20 @@ class TsidAllInOneNode(Node):
         t.transform.rotation.w = 1.0
         self.tf_broadcaster.sendTransform(t)
 
+        # 2. Joint State (여기 수정됨!)
         js = JointState()
         js.header.stamp = now
+        
+        # 기존 7개 관절 이름 + 손가락 2개 이름 추가
         js.name = [f"panda_joint{i+1}" for i in range(7)] + ["panda_finger_joint1", "panda_finger_joint2"]
+        
+        # 기존 7개 각도 + 손가락 벌림 정도(0.04m) 추가
+        # (손가락은 prismatic joint라 미터 단위입니다. 0.04면 4cm 벌림)
         js.position = q_arm.tolist() + [0.04, 0.04] 
+        
         self.joint_pub.publish(js)
 
+        # 3. Marker
         if self.traj:
             marker = Marker()
             marker.header.frame_id = "world"
@@ -153,27 +177,33 @@ class TsidAllInOneNode(Node):
             self.marker_pub.publish(marker)
 
     def run_simulation(self):
-        print("🚀 시뮬레이션 시작! (HQP 제어 & 모니터링 적용됨)")
+        print("🚀 시뮬레이션 시작! (Ki 제어 추가됨)")
         
-        Ki_pos, Ki_rot = 100.0, 50.0
-        dt = self.mj_model.opt.timestep 
+        # 1. 게인 설정 (I 게인 추가!)
+        Ki_pos = 40.0   # 위치 오차를 잡는 적분 게인
+        Ki_rot = 20.0    # 자세 오차를 잡는 적분 게인
+        dt = self.mj_model.opt.timestep # 시뮬레이션 타임스텝 (보통 0.002초)
 
+        # 오차 적분값 저장 변수 (누적 에러)
         integral_error_pos = np.zeros(3)
         integral_error_rot = np.zeros(3)
 
-        TOL_POS, TOL_ROT = 0.005, 0.05 
+        # 오차 허용 범위
+        TOL_POS = 0.005  # 0.5cm (더 엄격하게)
+        TOL_ROT = 0.05   # 약 2.8도
 
         # 터미널 출력을 위한 변수
         current_tau = np.zeros(self.n_arm)
-        q_lower = self.mj_model.jnt_range[:self.n_arm, 0]
-        q_upper = self.mj_model.jnt_range[:self.n_arm, 1]
-        last_print_time = 0.0
+        q_lower = self.mj_model.jnt_range[:self.n_arm, 0] # 관절 최소 각도 (rad)
+        q_upper = self.mj_model.jnt_range[:self.n_arm, 1] # 관절 최대 각도 (rad)
+        last_print_time = 0.0 # 로그 도배 방지용 타이머
 
         with mujoco.viewer.launch_passive(self.mj_model, self.mj_data) as viewer:
             while viewer.is_running() and rclpy.ok():
                 step_start = time.time()
                 current_sim_time = self.mj_data.time
                 
+                # --- 상태 업데이트 ---
                 q_arm = self.mj_data.qpos[:self.n_arm].copy()
                 v_arm = self.mj_data.qvel[:self.n_arm].copy()
                 q_pin = np.zeros(self.n_pin); q_pin[:self.n_arm] = q_arm
@@ -210,15 +240,21 @@ class TsidAllInOneNode(Node):
                             print(f"\n✅ 도착 완료! (오차 - Pos: {err_pos_norm:.4f}m, Rot: {err_rot_norm:.4f}rad)")
                             self.state = "IDLE" 
                         else:
+                            # 0.5초마다 한 번씩만 터미널에 상태 출력
                             if current_sim_time - last_print_time >= 0.5:
                                 print(f"\n⏳ 수렴 중... PosErr: {err_pos_norm:.3f}m, RotErr: {err_rot_norm:.3f}rad")
+                                
+                                # 1. 토크 포맷팅: | J1: 현재값/최댓값 | J2: 현재값/최댓값 | ...
                                 tau_strs = [f"J{i+1}: {abs(current_tau[i]):.1f}/{self.tau_max[i]:.0f}" for i in range(self.n_arm)]
                                 print("  [Torque] " + " | ".join(tau_strs))
+                                
+                                # 2. 각도 포맷팅: | J1: 현재값/[최소, 최대] | J2: 현재값/[최소, 최대] | ...
                                 q_strs = [f"J{i+1}: {q_arm[i]:.2f}/[{q_lower[i]:.2f}, {q_upper[i]:.2f}]" for i in range(self.n_arm)]
                                 print("  [Angle ] " + " | ".join(q_strs))
+                                
                                 last_print_time = current_sim_time
 
-                # --- 기구학 및 야코비안 계산 ---
+                # --- TSID 제어 (I 게인 적용) ---
                 pin.computeAllTerms(self.pin_model, self.pin_data, q_pin, v_pin)
                 pin.updateFramePlacements(self.pin_model, self.pin_data)
                 
@@ -226,7 +262,14 @@ class TsidAllInOneNode(Node):
                 
                 pin.computeJointJacobiansTimeVariation(self.pin_model, self.pin_data, q_pin, v_pin)
                 pin.updateFramePlacements(self.pin_model, self.pin_data)
-                Jdot = pin.getFrameJacobianTimeVariation(self.pin_model, self.pin_data, self.pin_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)[:, :self.n_arm]
+                Jdot_full = pin.getFrameJacobianTimeVariation(
+                    self.pin_model, 
+                    self.pin_data, 
+                    self.pin_ee_id, 
+                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+                )
+
+                Jdot = Jdot_full[:, :self.n_arm]
 
                 dJV = Jdot @ v_arm
                 curr_v_pin = pin.getFrameVelocity(self.pin_model, self.pin_data, self.pin_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).linear
@@ -239,6 +282,7 @@ class TsidAllInOneNode(Node):
                 if self.state == "MOVING": 
                     integral_error_pos += e_pos * dt
                     integral_error_rot += e_rot_vec * dt
+                    
                     limit = 0.25
                     integral_error_pos = np.clip(integral_error_pos, -limit, limit)
                     integral_error_rot = np.clip(integral_error_rot, -limit, limit)
@@ -250,40 +294,40 @@ class TsidAllInOneNode(Node):
                 e_post = self.q_nominal - q_arm
                 a_post = self.Kp_post * e_post - self.Kd_post * v_arm
                 
-                # --- HQP 제어 로직 ---
+                # --- 기존 QP 목적함수 및 토크 제약조건 계산 ---
+                P = (self.w_ee * J.T @ J) + (self.w_post * np.eye(self.n_arm)) + (1e-4 * np.eye(self.n_arm))
+                q_qp = -(self.w_ee * J.T @ b_acc) - (self.w_post * a_post)
                 M = self.pin_data.M[:self.n_arm, :self.n_arm]
-                h_coriolis = self.pin_data.nle[:self.n_arm] 
+                h = self.pin_data.nle[:self.n_arm]
                 
-                # 공통 부등식 제약조건: 토크 한계값 ( -tau_max <= M*ddq + h <= tau_max )
                 G_ineq = np.vstack([M, -M])
-                h_ineq = np.concatenate([self.tau_max - h_coriolis, self.tau_max + h_coriolis])
-                
-                # [Stage 1] 1순위: End-Effector Tracking
-                P1 = J.T @ J + (1e-4 * np.eye(self.n_arm))
-                q1 = -(J.T @ b_acc)
-                
-                ddq_1 = solve_qp(P1, q1, G_ineq, h_ineq, solver="osqp")
-                ddq_final = None
+                h_ineq = np.concatenate([self.tau_max - h, self.tau_max + h])
 
-                if ddq_1 is not None:
-                    # [Stage 2] 2순위: Posture Maintenance
-                    P2 = np.eye(self.n_arm) + (1e-4 * np.eye(self.n_arm))
-                    q2 = -a_post
-                    
-                    # 등식 제약조건: 1순위에서 얻은 EE의 가속도는 훼손하지 않을 것
-                    A_eq = J
-                    b_eq = J @ ddq_1
-                    
-                    ddq_2 = solve_qp(P2, q2, G_ineq, h_ineq, A=A_eq, b=b_eq, solver="osqp")
-                    
-                    # 만약 2단계에서 엄격한 등식조건 때문에 해를 못 찾으면(Infeasible), 1단계 결과라도 사용
-                    ddq_final = ddq_2 if ddq_2 is not None else ddq_1
+                # ---------------------------------------------------------
+                # 🛡️ [NEW] 2번 방법: 가상 댐퍼 (Control Barrier Function) 기반 관절 한계
+                # 한계에 가까워지면 스프링-댐퍼처럼 부드럽게 가속도를 밀어냅니다.
+                # ---------------------------------------------------------
+                margin = 0.05  # 한계치 충돌 전 여유 공간 (약 2.8도)
+                K_lim = 50.0   # 밀어내는 가상의 스프링 강성 (클수록 튕겨내는 힘이 강함)
+                D_lim = 2.0 * np.sqrt(K_lim)  # 진동을 막는 댐퍼 (임계 제동)
                 
-                # 제어 명령 적용
-                if ddq_final is not None: 
-                    current_tau = M @ ddq_final + h_coriolis
+                # 수식: ddq <= K_p * (q_limit - margin - q) - K_d * v
+                ddq_ub = K_lim * (q_upper - margin - q_arm) - D_lim * v_arm
+                ddq_lb = K_lim * (q_lower + margin - q_arm) - D_lim * v_arm
+                
+                # 현실적인 최대 가속도 제한 및 역전 현상 방지
+                ddq_ub = np.clip(ddq_ub, -50.0, 50.0)
+                ddq_lb = np.clip(ddq_lb, -50.0, 50.0)
+                ddq_lb = np.minimum(ddq_lb, ddq_ub - 0.1) # 하한이 상한보다 커지지 않도록 방어
+                # ---------------------------------------------------------
+                
+                # QP 솔버에 lb, ub 파라미터 적용
+                ddq = solve_qp(P, q_qp, G_ineq, h_ineq, lb=ddq_lb, ub=ddq_ub, solver="osqp")
+                
+                # QP 솔버 결과로 현재 토크(current_tau)를 계산하고 저장 및 적용
+                if ddq is not None: 
+                    current_tau = M @ ddq + h
                     self.mj_data.ctrl[:self.n_arm] = current_tau
-
                 mujoco.mj_step(self.mj_model, self.mj_data)
                 viewer.sync()
 
@@ -293,7 +337,6 @@ class TsidAllInOneNode(Node):
                 
                 dt_step = time.time() - step_start
                 if dt_step < self.mj_model.opt.timestep: time.sleep(self.mj_model.opt.timestep - dt_step)
-
 def main():
     rclpy.init()
     try: TsidAllInOneNode().run_simulation()
